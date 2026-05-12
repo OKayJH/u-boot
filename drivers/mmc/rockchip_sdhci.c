@@ -669,11 +669,11 @@ static const struct sdhci_data rk3576_data = {
 	.set_ios_post = dwcmshc_sdhci_set_ios_post,
 	.set_enhanced_strobe = dwcmshc_sdhci_set_enhanced_strobe,
 	.flags = RK_DLL_CMD_OUT | RK_TAP_VALUE_SEL,
-	.hs200_tx_tap = 16,
-	.hs400_tx_tap = 7,
-	.hs400_cmd_tap = 7,
-	.hs400_strbin_tap = 5,
-	.ddr50_strbin_delay_num = 16,
+	.hs200_tx_tap = 12,
+	.hs400_tx_tap = 6,
+	.hs400_cmd_tap = 6,
+	.hs400_strbin_tap = 3,
+	.ddr50_strbin_delay_num = 10,
 };
 
 static const struct udevice_id sdhci_ids[] = {
