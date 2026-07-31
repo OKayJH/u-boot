@@ -136,20 +136,15 @@ static int fit_image_get_param(const void *fit, const char *prop_name,
 	return fdt_image_get_load(fit, prop_name, load);
 }
 
-static void *fit_get_blob(struct blk_desc *dev_desc,
-			  disk_partition_t *out_part,
-			  bool verify)
+static void *fit_get_blob_from_part(struct blk_desc *dev_desc,
+				    disk_partition_t *out_part,
+				    bool verify,
+				    const char *part_name)
 {
 	__maybe_unused int conf_noffset;
 	disk_partition_t part;
-	char *part_name = PART_BOOT;
 	void *fit, *fdt;
 	int blk_num;
-
-#ifndef CONFIG_ANDROID_AB
-	if (rockchip_get_boot_mode() == BOOT_MODE_RECOVERY)
-		part_name = PART_RECOVERY;
-#endif
 
 	if (part_get_info_by_name(dev_desc, part_name, &part) < 0) {
 		FIT_I("No %s partition\n", part_name);
@@ -212,6 +207,32 @@ static void *fit_get_blob(struct blk_desc *dev_desc,
 fail:
 	free(fdt);
 	return NULL;
+}
+
+static void *fit_get_blob(struct blk_desc *dev_desc,
+			  disk_partition_t *out_part,
+			  bool verify)
+{
+	char *part_name = PART_BOOT;
+	void *fit;
+
+#ifndef CONFIG_ANDROID_AB
+	if (rockchip_get_boot_mode() == BOOT_MODE_RECOVERY)
+		part_name = PART_RECOVERY;
+#endif
+
+	fit = fit_get_blob_from_part(dev_desc, out_part, verify, part_name);
+	/*
+	 * Anti-brick: if normal boot partition has no usable FIT, fall back to
+	 * recovery (factory/golden kernel). Skip when already in recovery mode.
+	 */
+	if (!fit && strcmp(part_name, PART_RECOVERY) != 0) {
+		FIT_I("boot FIT unavailable, try recovery\n");
+		fit = fit_get_blob_from_part(dev_desc, out_part, verify,
+					     PART_RECOVERY);
+	}
+
+	return fit;
 }
 
 static int fit_image_fixup_alloc(const void *fit, const char *prop_name,
