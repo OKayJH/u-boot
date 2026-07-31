@@ -20,6 +20,173 @@ DECLARE_GLOBAL_DATA_PTR;
  */
 #define FIT_FDT_MAX_SIZE		SZ_4K
 
+/*
+ * DLCVCAM boot-try (anti-brick for "FIT OK but kernel fails to stay up"):
+ * Stored on misc at a fixed byte offset past Android BCB (0 / 16KiB) and
+ * virtual-AB metadata (32KiB). Userspace clears try_count after multi-user.
+ *
+ * Layout (little-endian on disk as raw bytes written by blk_dwrite):
+ *   magic 'DCBT' (0x54424344 LE), ver, try_count, limit, flags, reserved...
+ */
+#define DLCVCAM_BOOTTRY_MAGIC		0x54424344u	/* 'DCBT' */
+#define DLCVCAM_BOOTTRY_VERSION		1u
+#define DLCVCAM_BOOTTRY_OFF_BYTES	(48 * 1024)
+#define DLCVCAM_BOOTTRY_DEFAULT_LIMIT	2u
+#define DLCVCAM_BOOTTRY_F_STICKY	(1u << 0)
+
+struct dlcvcam_boot_try {
+	u32 magic;
+	u32 version;
+	u32 try_count;
+	u32 limit;
+	u32 flags;
+	u32 reserved[3];
+};
+
+/* Read/write a small record at byte_off inside misc (RMW one block). */
+static int dlcvcam_misc_rw(int write, u32 byte_off, void *buf, u32 len)
+{
+	struct blk_desc *dev_desc;
+	disk_partition_t part;
+	lbaint_t start;
+	u32 blksz, blk_off, within;
+	void *blkbuf;
+	int ret = -1;
+
+	dev_desc = rockchip_get_bootdev();
+	if (!dev_desc)
+		return -ENODEV;
+	if (part_get_info_by_name(dev_desc, PART_MISC, &part) < 0)
+		return -ENOENT;
+
+	blksz = dev_desc->blksz;
+	if (!blksz || !len || len > blksz)
+		return -EINVAL;
+
+	blk_off = byte_off / blksz;
+	within = byte_off % blksz;
+	if (within + len > blksz)
+		return -EINVAL;
+	if (blk_off >= part.size)
+		return -EINVAL;
+
+	start = part.start + blk_off;
+	blkbuf = memalign(ARCH_DMA_MINALIGN, blksz);
+	if (!blkbuf)
+		return -ENOMEM;
+
+	if (blk_dread(dev_desc, start, 1, blkbuf) != 1)
+		goto out;
+
+	if (write) {
+		memcpy((u8 *)blkbuf + within, buf, len);
+		if (blk_dwrite(dev_desc, start, 1, blkbuf) == 1)
+			ret = 0;
+	} else {
+		memcpy(buf, (u8 *)blkbuf + within, len);
+		ret = 0;
+	}
+out:
+	free(blkbuf);
+	return ret;
+}
+
+static void dlcvcam_boot_try_sanitize(struct dlcvcam_boot_try *t)
+{
+	if (t->magic != DLCVCAM_BOOTTRY_MAGIC ||
+	    t->version != DLCVCAM_BOOTTRY_VERSION ||
+	    t->limit == 0 || t->limit > 16) {
+		memset(t, 0, sizeof(*t));
+		t->magic = DLCVCAM_BOOTTRY_MAGIC;
+		t->version = DLCVCAM_BOOTTRY_VERSION;
+		t->try_count = 0;
+		t->limit = DLCVCAM_BOOTTRY_DEFAULT_LIMIT;
+		t->flags = 0;
+	}
+}
+
+static void dlcvcam_write_bcb_recovery(void)
+{
+	struct bootloader_message bmsg;
+	struct blk_desc *dev_desc;
+	disk_partition_t part;
+	u32 bcb_offset, cnt;
+
+	dev_desc = rockchip_get_bootdev();
+	if (!dev_desc)
+		return;
+	if (part_get_info_by_name(dev_desc, PART_MISC, &part) < 0)
+		return;
+
+#ifdef CONFIG_ANDROID_BOOT_IMAGE
+	bcb_offset = android_bcb_msg_sector_offset();
+#else
+	bcb_offset = BCB_MESSAGE_BLK_OFFSET;
+#endif
+	memset(&bmsg, 0, sizeof(bmsg));
+	strncpy(bmsg.command, "boot-recovery", sizeof(bmsg.command) - 1);
+	cnt = DIV_ROUND_UP(sizeof(bmsg), dev_desc->blksz);
+	if (blk_dwrite(dev_desc, part.start + bcb_offset, cnt, &bmsg) != cnt)
+		FIT_I("boot-try: BCB write failed\n");
+}
+
+/*
+ * Decide boot vs recovery for this power-cycle. Called once; result cached
+ * because fit_get_blob() runs multiple times (kernel/fdt/resource).
+ *
+ * - Already in recovery boot mode (BCB/key/env): do not touch counter.
+ * - Sticky flag or try_count >= limit: force recovery, latch sticky + BCB.
+ * - Else: try_count++, attempt boot (FIT-unavailable path may still fall back).
+ */
+static const char *dlcvcam_select_boot_part(void)
+{
+	static int decided;
+	static const char *part_name = PART_BOOT;
+	struct dlcvcam_boot_try t;
+	u32 limit;
+
+	if (decided)
+		return part_name;
+	decided = 1;
+
+#ifndef CONFIG_ANDROID_AB
+	if (rockchip_get_boot_mode() == BOOT_MODE_RECOVERY) {
+		part_name = PART_RECOVERY;
+		FIT_I("boot-try: mode=recovery (bcb/env/key), skip counter\n");
+		return part_name;
+	}
+#endif
+
+	memset(&t, 0, sizeof(t));
+	if (dlcvcam_misc_rw(0, DLCVCAM_BOOTTRY_OFF_BYTES, &t, sizeof(t))) {
+		FIT_I("boot-try: misc read fail, use boot\n");
+		return part_name;
+	}
+	dlcvcam_boot_try_sanitize(&t);
+	limit = t.limit ? t.limit : DLCVCAM_BOOTTRY_DEFAULT_LIMIT;
+
+	if ((t.flags & DLCVCAM_BOOTTRY_F_STICKY) || t.try_count >= limit) {
+		FIT_I("boot-try: force recovery (try=%u limit=%u sticky=%u)\n",
+		      t.try_count, limit,
+		      (t.flags & DLCVCAM_BOOTTRY_F_STICKY) ? 1 : 0);
+		t.flags |= DLCVCAM_BOOTTRY_F_STICKY;
+		if (t.try_count < limit)
+			t.try_count = limit;
+		dlcvcam_misc_rw(1, DLCVCAM_BOOTTRY_OFF_BYTES, &t, sizeof(t));
+		dlcvcam_write_bcb_recovery();
+		part_name = PART_RECOVERY;
+		return part_name;
+	}
+
+	t.try_count++;
+	FIT_I("boot-try: attempt boot try=%u/%u\n", t.try_count, limit);
+	if (dlcvcam_misc_rw(1, DLCVCAM_BOOTTRY_OFF_BYTES, &t, sizeof(t)))
+		FIT_I("boot-try: misc write fail (continue boot)\n");
+
+	part_name = PART_BOOT;
+	return part_name;
+}
+
 static int fit_is_ext_type(const void *fit)
 {
 	return fdt_totalsize(fit) < FIT_FDT_MAX_SIZE;
@@ -213,18 +380,20 @@ static void *fit_get_blob(struct blk_desc *dev_desc,
 			  disk_partition_t *out_part,
 			  bool verify)
 {
-	char *part_name = PART_BOOT;
+	const char *part_name;
 	void *fit;
 
-#ifndef CONFIG_ANDROID_AB
-	if (rockchip_get_boot_mode() == BOOT_MODE_RECOVERY)
-		part_name = PART_RECOVERY;
-#endif
+	/*
+	 * Boot-try counter (misc@48KiB) may force recovery when previous
+	 * boot attempts did not reach userspace confirm. Still fall back if
+	 * the chosen partition has no usable FIT.
+	 */
+	part_name = dlcvcam_select_boot_part();
 
 	fit = fit_get_blob_from_part(dev_desc, out_part, verify, part_name);
 	/*
 	 * Anti-brick: if normal boot partition has no usable FIT, fall back to
-	 * recovery (factory/golden kernel). Skip when already in recovery mode.
+	 * recovery (factory/golden kernel). Skip when already selecting recovery.
 	 */
 	if (!fit && strcmp(part_name, PART_RECOVERY) != 0) {
 		FIT_I("boot FIT unavailable, try recovery\n");
