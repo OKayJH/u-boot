@@ -55,6 +55,8 @@ systemctl daemon-reload && systemctl enable --now dlcvcam-boot-try-confirm.servi
 
 ## 相关 PR
 
+板端完整运维（金镜像 sync、confirm、看门狗、部署检查）：CamOS `docs/admin/DLCVCAM内核防砖与金镜像维护.md`（随 Admin 仓）。
+
 - U-Boot：本分支 `feat/rk3576-fit-boot-recovery-fallback`  
 - Kernel 编包：https://github.com/dl-cv/kernel/pull/15  
 - Admin 内核升级 / seed / 安装：CamOS `feat/admin-kernel-update`
