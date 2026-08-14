@@ -1,0 +1,12 @@
+[Unit]
+Description=DLCVCAM clear boot-try after successful multi-user boot
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/dlcvcam_boot_try.py confirm
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
