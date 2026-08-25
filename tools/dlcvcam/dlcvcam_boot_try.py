@@ -78,8 +78,8 @@ def write_record(
 
 
 def clear_bcb(path: Path = MISC) -> None:
-    """Clear Android BCB command at offset 0 and 16KiB (stock dual layout)."""
-    zeros = b"\x00" * 2048
+    """Clear only the Android BCB command fields in the two known layouts."""
+    zeros = b"\x00" * 32
     with path.open("r+b", buffering=0) as f:
         for off in (0, 16 * 1024):
             f.seek(off)
